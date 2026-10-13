@@ -55,17 +55,23 @@ impl ToNapiValue for RawTransferBuffer {
                     &raw mut array_buffer,
                 )
             };
-            if status == sys::Status::napi_ok {
-                return Ok(array_buffer);
+            match status {
+                sys::Status::napi_ok => return Ok(array_buffer),
+                // Runtime does not support external `ArrayBuffer`s (e.g. Electron).
+                // The finalizer has not been registered, so free the memory.
+                // SAFETY: `ptr` was allocated by `block::alloc`, and not passed to JS
+                sys::Status::napi_no_external_buffers_allowed => unsafe { block::free(ptr) },
+                // Creating the `ArrayBuffer` failed for some other reason. Depending on where it failed,
+                // the runtime may already have called the finalizer, or may call it later (e.g. NodeJS's
+                // `node::Buffer::New` calls it on some error paths), so freeing the memory here could
+                // free it twice. Leak it instead. No pages have been written to, so this only leaks
+                // address space.
+                _ => {}
             }
 
-            // Creating external `ArrayBuffer` failed, or is not supported by the runtime
-            // (`napi_no_external_buffers_allowed`). The finalizer is not called in that case,
-            // so free the memory, and return `null`. JS will fall back to allocating the buffer itself.
+            // Return `null`. JS will fall back to allocating the buffer itself.
             // Note: Do not use napi-rs's `Uint8Array::with_external_data`, because when external buffers
             // are not allowed, it copies the data into a new `ArrayBuffer`, which here would be 2 GiB.
-            // SAFETY: `ptr` was allocated by `block::alloc`, and not passed to JS
-            unsafe { block::free(ptr) };
         }
 
         let mut null = ptr::null_mut();
@@ -112,29 +118,24 @@ mod block {
 
     const _: () = assert!(BLOCK_SIZE <= MAPPING_SIZE && MAPPING_SIZE - BLOCK_SIZE < 4096);
 
-    /// Map flags. `MAP_NORESERVE` on Linux, so the mapping does not count against overcommit limits
-    /// (memory is only committed when pages are written to, same as for a JS `ArrayBuffer`).
-    #[cfg(target_os = "linux")]
+    /// Map flags. `MAP_NORESERVE` on Linux and Android, so the mapping does not count against overcommit
+    /// limits (memory is only committed when pages are written to, same as for a JS `ArrayBuffer`).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     const MAP_FLAGS: libc::c_int = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     const MAP_FLAGS: libc::c_int = libc::MAP_PRIVATE | libc::MAP_ANON;
 
     /// Allocate a zeroed region of `MAPPING_SIZE` bytes, aligned on `BLOCK_ALIGN`.
     ///
-    /// Reserves `RESERVE_SIZE` bytes, and then unmaps the parts before and after the aligned region.
+    /// Reserves `RESERVE_SIZE` bytes, unmaps the parts before and after the aligned region,
+    /// and then makes the aligned region readable and writable.
+    /// The reservation is inaccessible (`PROT_NONE`), so it is not charged against the commit limit
+    /// when overcommit is disabled (Linux ignores `MAP_NORESERVE` then). Only the aligned region is.
     /// Returns `None` if allocation fails.
     pub fn alloc() -> Option<NonNull<u8>> {
         // SAFETY: Anonymous private mapping, not backed by a file. No existing memory is affected.
-        let start_ptr = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                RESERVE_SIZE,
-                libc::PROT_READ | libc::PROT_WRITE,
-                MAP_FLAGS,
-                -1,
-                0,
-            )
-        };
+        let start_ptr =
+            unsafe { libc::mmap(ptr::null_mut(), RESERVE_SIZE, libc::PROT_NONE, MAP_FLAGS, -1, 0) };
         if start_ptr == libc::MAP_FAILED {
             return None;
         }
@@ -147,7 +148,7 @@ mod block {
         let head_size = start.next_multiple_of(BLOCK_ALIGN) - start;
         let tail_size = RESERVE_SIZE - head_size - MAPPING_SIZE;
 
-        // SAFETY: Both regions are within the mapping created above, and page-aligned.
+        // SAFETY: All regions are within the mapping created above, and page-aligned.
         // Nothing else has access to the mapping yet.
         unsafe {
             let aligned_ptr = start_ptr.add(head_size);
@@ -157,6 +158,18 @@ mod block {
             }
             let result = libc::munmap(aligned_ptr.add(MAPPING_SIZE).cast(), tail_size);
             debug_assert_eq!(result, 0);
+
+            let result = libc::mprotect(
+                aligned_ptr.cast(),
+                MAPPING_SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+            );
+            if result != 0 {
+                // e.g. commit limit reached
+                let result = libc::munmap(aligned_ptr.cast(), MAPPING_SIZE);
+                debug_assert_eq!(result, 0);
+                return None;
+            }
 
             debug_assert!(aligned_ptr.addr().is_multiple_of(BLOCK_ALIGN));
             Some(NonNull::new_unchecked(aligned_ptr))
