@@ -11,9 +11,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use oxc_allocator::{Allocator, CloneIn};
 use oxc_ast::{
     ast::{
-        ArrayExpression, ArrowFunctionExpression, BindingPattern, Expression, Function,
-        IdentifierReference, LogicalOperator, ObjectExpression, ObjectPropertyKind, Program,
-        PropertyKey, PropertyKind, Statement,
+        ArrayExpression, ArrowFunctionExpression, AssignmentExpression, BindingPattern, Expression,
+        Function, IdentifierReference, LogicalOperator, ObjectExpression, ObjectPropertyKind,
+        Program, PropertyKey, PropertyKind, Statement, UpdateExpression,
     },
     builder::AstBuilder,
 };
@@ -1796,13 +1796,18 @@ fn get_constants(schema: &Schema) -> Constants {
 
 /// Visitor to inline calls to trivial functions, and remove those functions.
 ///
-/// A function is trivial if it's a top-level function declaration with a single parameter,
-/// its body is a single `return` statement, the parameter is referenced exactly once in the return value,
-/// and the return value contains no object or array literals or functions
-/// (so inlining doesn't duplicate allocation sites).
+/// A function is trivial if it's a top-level, non-async, non-generator function declaration with a single
+/// parameter, its body is a single `return` statement, the parameter is referenced exactly once in the
+/// return value, and the return value contains no object or array literals or functions
+/// (so inlining doesn't duplicate allocation sites), and no assignments or updates.
 ///
 /// e.g. given `function deserializeBoxFoo(pos) { return deserializeFoo(int32[pos >> 2]); }`,
 /// `deserializeBoxFoo(pos + 8)` becomes `deserializeFoo(int32[(pos + 8) >> 2])`.
+///
+/// Inlining moves evaluation of the argument to where the parameter is used in the return value,
+/// so it may run after other parts of the return value, instead of before. That's only correct if
+/// arguments have no side effects, and are not affected by side effects of the return value.
+/// Arguments in the generated code are position arithmetic (e.g. `pos + 8`), which satisfies that.
 ///
 /// V8 does not inline function calls until the calling function is optimized, so before that,
 /// calls to these tiny functions are a significant cost. Inlining them speeds up deserialization
@@ -1823,6 +1828,9 @@ impl<'a> TrivialFunctionInliner<'a> {
             .iter()
             .filter_map(|stmt| {
                 let Statement::FunctionDeclaration(func) = stmt else { return None };
+                if func.r#async || func.generator {
+                    return None;
+                }
                 let name = func.id.as_ref()?.name.as_str();
                 let [param] = func.params.items.as_slice() else { return None };
                 if func.params.rest.is_some() {
@@ -1864,17 +1872,22 @@ impl<'a> VisitMut<'a> for TrivialFunctionInliner<'a> {
 
         let Expression::CallExpression(call_expr) = expr else { return };
         let Expression::Identifier(callee) = &call_expr.callee else { return };
-        let Some((param, value)) = self.functions.get(callee.name.as_str()) else { return };
+        let callee_name = callee.name;
+        let Some((param, value)) = self.functions.get(callee_name.as_str()) else { return };
         let (param, mut value) = (*param, value.clone_in(self.allocator));
 
         assert!(
             call_expr.arguments.len() == 1 && call_expr.arguments[0].is_expression(),
-            "Trivial function `{}` must be called with a single argument",
-            callee.name
+            "Trivial function `{callee_name}` must be called with a single argument"
         );
         let arg = call_expr.arguments.pop().unwrap().into_expression();
 
-        ParamReplacer { param, arg: Some(arg) }.visit_expression(&mut value);
+        let mut replacer = ParamReplacer { param, arg: Some(arg) };
+        replacer.visit_expression(&mut value);
+        assert!(
+            replacer.arg.is_none(),
+            "Parameter of trivial function `{callee_name}` was not replaced by the call's argument"
+        );
         *expr = value;
 
         // Inlined value may contain calls to other trivial functions
@@ -1910,6 +1923,15 @@ impl<'a> Visit<'a> for TrivialFunctionChecker<'_> {
     }
 
     fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {
+        self.is_trivial = false;
+    }
+
+    // `ParamReplacer` only replaces the parameter where it's an expression, not an assignment target
+    fn visit_assignment_expression(&mut self, _: &AssignmentExpression<'a>) {
+        self.is_trivial = false;
+    }
+
+    fn visit_update_expression(&mut self, _: &UpdateExpression<'a>) {
         self.is_trivial = false;
     }
 }
@@ -1994,5 +2016,49 @@ impl<'a> VisitMut<'a> for LocFieldAdder<'a> {
         }
 
         walk_mut::walk_object_expression(self, obj_expr);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use oxc_allocator::Allocator;
+    use oxc_codegen::Codegen;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    use super::TrivialFunctionInliner;
+
+    fn inline(source_text: &str) -> String {
+        let allocator = Allocator::default();
+        let mut program = Parser::new(&allocator, source_text, SourceType::mjs()).parse().program;
+        TrivialFunctionInliner::inline(&mut program, &allocator);
+        Codegen::new().build(&program).code
+    }
+
+    #[test]
+    fn inlines_trivial_functions() {
+        let code = inline(
+            "function boxed(pos) { return inner(int32[pos >> 2]); }
+            function f(pos, x) { return boxed(pos + 8); }",
+        );
+        assert!(!code.contains("boxed"), "{code}");
+        assert!(code.contains("inner(int32[pos + 8 >> 2])"), "{code}");
+    }
+
+    #[test]
+    fn does_not_inline_unsuitable_functions() {
+        let funcs = [
+            "function g(pos) { return pos++; }",
+            "function g(pos) { return pos = 1; }",
+            "function g(pos) { return [pos]; }",
+            "function g(pos) { return () => pos; }",
+            "function g(pos) { return pos + pos; }",
+            "async function g(pos) { return pos; }",
+            "function* g(pos) { return pos; }",
+        ];
+        for func in funcs {
+            let code = inline(&format!("{func} function f(pos, x) {{ return g(pos + 8); }}"));
+            assert!(code.contains("g(pos + 8)"), "{func}\n{code}");
+        }
     }
 }
