@@ -3,7 +3,7 @@ import { rawTransferSupported as rawTransferSupportedBinding } from "../bindings
 let rawTransferIsSupported = null;
 
 /**
- * Returns `true` if `experimentalRawTransfer` is option is supported.
+ * Returns `true` if `experimentalRawTransfer` option is supported.
  *
  * Raw transfer is only supported on 64-bit little-endian systems,
  * and NodeJS >= v22.0.0, Deno >= v2.0.0, or Bun >= v1.2.0 (not on Windows).
